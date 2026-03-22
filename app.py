@@ -1,451 +1,841 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Credit Card SMS Tracker</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 24px;
-            background: #f7f7f9;
-            color: #222;
-        }
-        .card {
-            background: white;
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-        }
-        h1, h2 { margin-top: 0; }
-        textarea {
-            width: 100%;
-            min-height: 140px;
-            padding: 12px;
-            border: 1px solid #ccc;
-            border-radius: 8px;
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        button, select {
-            padding: 10px 16px;
-            margin-right: 10px;
-            margin-top: 12px;
-            border-radius: 8px;
-            font-size: 14px;
-        }
-        button {
-            border: none;
-            cursor: pointer;
-            background: #2563eb;
-            color: white;
-        }
-        button.secondary { background: #475569; }
-        button.danger { background: #dc2626; }
-        button.small {
-            padding: 6px 10px;
-            font-size: 12px;
-            margin-top: 0;
-            margin-right: 0;
-        }
-        select {
-            border: 1px solid #ccc;
-            background: white;
-            color: #222;
-        }
-        pre {
-            background: #111827;
-            color: #f9fafb;
-            padding: 14px;
-            border-radius: 8px;
-            overflow-x: auto;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-            gap: 16px;
-        }
-        .stat {
-            background: #eff6ff;
-            border-radius: 10px;
-            padding: 14px;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 12px;
-            background: white;
-        }
-        th, td {
-            border-bottom: 1px solid #e5e7eb;
-            text-align: left;
-            padding: 10px 8px;
-            font-size: 14px;
-            vertical-align: top;
-        }
-        th { background: #f3f4f6; }
-        .muted { color: #6b7280; font-size: 13px; }
-        .success { color: #166534; }
-        .error { color: #b91c1c; }
-        .toolbar {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 10px;
-        }
-        canvas {
-            margin-top: 12px;
-            max-height: 380px;
-        }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>Credit Card SMS Tracker</h1>
-        <div class="muted">Paste an SMS, parse it, save it, filter by card, and delete entries.</div>
-    </div>
+import os
+import re
+import json
+from datetime import datetime
+from typing import Optional, Dict, Tuple, List, Any
 
-    <div class="card">
-        <h2>Enter SMS</h2>
-        <textarea id="smsInput" placeholder="Example: UOB: Spent USD 12.50 at AMAZON on 21/03/26 card ending with 1234"></textarea>
-        <div>
-            <button onclick="parseSms()">Parse SMS</button>
-            <button onclick="submitSms()">Submit Transaction</button>
-            <button class="secondary" onclick="loadDashboard()">Refresh Dashboard</button>
-            <button class="danger" onclick="resetAll()">Reset All</button>
-        </div>
-        <p id="status" class="muted"></p>
-    </div>
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
 
-    <div class="card">
-        <h2>Parse / Submit Result</h2>
-        <pre id="resultBox">No result yet.</pre>
-    </div>
+import pandas as pd
+import requests
+from openpyxl import Workbook, load_workbook
 
-    <div class="card">
-        <h2>Stats</h2>
-        <div class="grid" id="statsGrid"></div>
-    </div>
+app = Flask(__name__)
+CORS(app)
 
-    <div class="card">
-        <h2>Spending Trend</h2>
-        <div class="muted">Daily spending in SGD for the selected card or all cards.</div>
-        <canvas id="spendingChart" height="110"></canvas>
-    </div>
+HEADERS = [
+    "Card_Last_4",
+    "Bank",
+    "Card_Label",
+    "Date",
+    "Currency",
+    "Amount",
+    "FX_Rate_To_SGD",
+    "Amount_SGD",
+    "FX_Rate_Date",
+    "FX_Source",
+    "Description",
+    "Raw_SMS",
+    "Created_At",
+]
 
-    <div class="card">
-        <h2>Monthly Totals</h2>
-        <pre id="monthlyTotals">Loading...</pre>
-    </div>
+BASE_CURRENCY = "SGD"
+FX_SOURCE_NAME = "Frankfurter"
+FX_API_BASE_URL = "https://api.frankfurter.dev/v1"
 
-    <div class="card">
-        <h2>Transactions</h2>
 
-        <div class="toolbar">
-            <label for="cardFilter"><strong>Show card:</strong></label>
-            <select id="cardFilter" onchange="loadDashboard()">
-                <option value="">All Cards</option>
-            </select>
-            <button class="secondary" onclick="loadDashboard()">Apply Filter</button>
-        </div>
+def resolve_data_dir() -> str:
+    env_dir = os.getenv("DATA_DIR")
+    if env_dir:
+        return env_dir
 
-        <div id="transactionsWrap">Loading...</div>
-    </div>
+    render_disk = "/app/data"
+    if os.path.exists(render_disk):
+        return render_disk
 
-    <script>
-        let spendingChartInstance = null;
+    return os.path.join(os.getcwd(), "data")
 
-        async function apiGet(url) {
-            const res = await fetch(url);
-            return await res.json();
+
+DATA_DIR = resolve_data_dir()
+EXCEL_FILE = os.path.join(DATA_DIR, "transactions.xlsx")
+STATE_FILE = os.path.join(DATA_DIR, "app_state.json")
+FX_CACHE_FILE = os.path.join(DATA_DIR, "fx_cache.json")
+
+
+def refresh_paths() -> None:
+    global EXCEL_FILE, STATE_FILE, FX_CACHE_FILE
+    EXCEL_FILE = os.path.join(DATA_DIR, "transactions.xlsx")
+    STATE_FILE = os.path.join(DATA_DIR, "app_state.json")
+    FX_CACHE_FILE = os.path.join(DATA_DIR, "fx_cache.json")
+
+
+def ensure_data_folder() -> None:
+    global DATA_DIR
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except PermissionError:
+        DATA_DIR = os.path.join(os.getcwd(), "data")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        refresh_paths()
+
+
+def create_excel_if_missing() -> None:
+    if not os.path.exists(EXCEL_FILE):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Transactions"
+        ws.append(HEADERS)
+        wb.save(EXCEL_FILE)
+
+
+def create_state_if_missing() -> None:
+    if not os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"last_reset_month": ""}, f, indent=2)
+
+
+def create_fx_cache_if_missing() -> None:
+    if not os.path.exists(FX_CACHE_FILE):
+        with open(FX_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=2)
+
+
+def get_excel_headers() -> List[str]:
+    if not os.path.exists(EXCEL_FILE):
+        return []
+
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb["Transactions"]
+    first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not first_row:
+        return []
+
+    return [str(col) if col is not None else "" for col in first_row]
+
+
+def rebuild_excel_with_new_headers() -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transactions"
+    ws.append(HEADERS)
+    wb.save(EXCEL_FILE)
+
+
+def initialize_files() -> None:
+    ensure_data_folder()
+    create_excel_if_missing()
+    create_state_if_missing()
+    create_fx_cache_if_missing()
+
+    existing_headers = get_excel_headers()
+    if existing_headers and existing_headers != HEADERS:
+        rebuild_excel_with_new_headers()
+
+
+def read_state() -> Dict[str, Any]:
+    create_state_if_missing()
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_state(state: Dict[str, Any]) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def read_fx_cache() -> Dict[str, Any]:
+    create_fx_cache_if_missing()
+    with open(FX_CACHE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_fx_cache(cache: Dict[str, Any]) -> None:
+    with open(FX_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2)
+
+
+def clear_excel_transactions() -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transactions"
+    ws.append(HEADERS)
+    wb.save(EXCEL_FILE)
+
+
+def ensure_monthly_reset(today: Optional[datetime] = None) -> None:
+    if today is None:
+        today = datetime.now()
+
+    current_month_key = today.strftime("%Y-%m")
+    state = read_state()
+    last_reset_month = state.get("last_reset_month", "")
+
+    if today.day == 1 and last_reset_month != current_month_key:
+        clear_excel_transactions()
+        state["last_reset_month"] = current_month_key
+        write_state(state)
+
+
+def parse_date_to_datetime(date_text: str) -> Optional[datetime]:
+    formats = ["%d/%m/%y", "%d/%m/%Y"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_text.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_date(text: str) -> Optional[str]:
+    match = re.search(r"\b(\d{2}/\d{2}/(?:\d{2}|\d{4}))\b", text)
+    return match.group(1) if match else None
+
+
+def extract_amount_and_currency(text: str) -> Tuple[Optional[str], Optional[float]]:
+    match = re.search(r"\b([A-Z]{3})\s*([\d,]+(?:\.\d{1,2})?)\b", text, re.IGNORECASE)
+    if not match:
+        return None, None
+
+    currency = match.group(1).upper()
+    amount_str = match.group(2).replace(",", "")
+
+    try:
+        return currency, float(amount_str)
+    except ValueError:
+        return currency, None
+
+
+def extract_description(text: str) -> Optional[str]:
+    match = re.search(
+        r"\bat\s+(.+?)(?:\.\s|\s+[A-Z]{3}\b|\s+card\s+ending\s+with\b|\s+ending\s+with\b|$)",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1).strip(" .") if match else None
+
+
+def extract_card_last_4(text: str) -> Optional[str]:
+    match = re.search(r"ending(?:\s+with)?\s+(\d{4})\b", text, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def parse_sms_content(text: str) -> Dict[str, Optional[Any]]:
+    date_text = extract_date(text)
+    currency, amount = extract_amount_and_currency(text)
+    description = extract_description(text)
+    card_last_4 = extract_card_last_4(text)
+
+    return {
+        "date": date_text,
+        "currency": currency,
+        "amount": amount,
+        "description": description,
+        "card_last_4": card_last_4,
+    }
+
+
+def to_api_date(date_text: str) -> Optional[str]:
+    parsed = parse_date_to_datetime(date_text)
+    return parsed.strftime("%Y-%m-%d") if parsed else None
+
+
+def build_fx_cache_key(date_yyyy_mm_dd: str, from_currency: str, to_currency: str) -> str:
+    return f"{date_yyyy_mm_dd}|{from_currency.upper()}|{to_currency.upper()}"
+
+
+def get_historical_fx_rate_to_sgd(from_currency: str, transaction_date: str) -> Dict[str, Any]:
+    from_currency = from_currency.upper()
+
+    if from_currency == BASE_CURRENCY:
+        api_date = to_api_date(transaction_date)
+        return {
+            "success": True,
+            "rate": 1.0,
+            "fx_rate_date": api_date,
+            "source": FX_SOURCE_NAME,
+            "message": "Base currency is already SGD.",
         }
 
-        async function apiPost(url, payload) {
-            const res = await fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-            return { ok: res.ok, data };
+    api_date = to_api_date(transaction_date)
+    if not api_date:
+        return {
+            "success": False,
+            "rate": None,
+            "fx_rate_date": None,
+            "source": FX_SOURCE_NAME,
+            "message": "Invalid transaction date for FX conversion.",
         }
 
-        async function apiDelete(url) {
-            const res = await fetch(url, { method: "DELETE" });
-            const data = await res.json();
-            return { ok: res.ok, data };
+    cache = read_fx_cache()
+    cache_key = build_fx_cache_key(api_date, from_currency, BASE_CURRENCY)
+
+    if cache_key in cache:
+        cached = cache[cache_key]
+        return {
+            "success": True,
+            "rate": cached.get("rate"),
+            "fx_rate_date": cached.get("fx_rate_date"),
+            "source": cached.get("source", FX_SOURCE_NAME),
+            "message": "Loaded FX rate from cache.",
         }
 
-        function setStatus(message, isError = false) {
-            const el = document.getElementById("status");
-            el.textContent = message;
-            el.className = isError ? "error" : "success";
-        }
+    url = f"{FX_API_BASE_URL}/{api_date}"
+    params = {"base": from_currency, "symbols": BASE_CURRENCY}
 
-        async function parseSms() {
-            const sms = document.getElementById("smsInput").value.trim();
-            if (!sms) {
-                setStatus("Please enter SMS content first.", true);
-                return;
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        rates = data.get("rates", {})
+        rate = rates.get(BASE_CURRENCY)
+        fx_rate_date = data.get("date")
+
+        if rate is None:
+            return {
+                "success": False,
+                "rate": None,
+                "fx_rate_date": fx_rate_date,
+                "source": FX_SOURCE_NAME,
+                "message": f"No FX rate returned for {from_currency}->{BASE_CURRENCY}.",
             }
 
-            setStatus("Parsing...");
-            const result = await apiPost("/api/parse", { sms_content: sms });
-            document.getElementById("resultBox").textContent = JSON.stringify(result.data, null, 2);
-            setStatus(result.ok ? "Parse completed." : "Parse failed.", !result.ok);
+        cache[cache_key] = {
+            "rate": float(rate),
+            "fx_rate_date": fx_rate_date,
+            "source": FX_SOURCE_NAME,
+        }
+        write_fx_cache(cache)
+
+        return {
+            "success": True,
+            "rate": float(rate),
+            "fx_rate_date": fx_rate_date,
+            "source": FX_SOURCE_NAME,
+            "message": "FX rate fetched successfully.",
         }
 
-        async function submitSms() {
-            const sms = document.getElementById("smsInput").value.trim();
-            if (!sms) {
-                setStatus("Please enter SMS content first.", true);
-                return;
+    except requests.RequestException as e:
+        return {
+            "success": False,
+            "rate": None,
+            "fx_rate_date": None,
+            "source": FX_SOURCE_NAME,
+            "message": f"FX API request failed: {e}",
+        }
+    except ValueError as e:
+        return {
+            "success": False,
+            "rate": None,
+            "fx_rate_date": None,
+            "source": FX_SOURCE_NAME,
+            "message": f"FX API response parse failed: {e}",
+        }
+
+
+def convert_amount_to_sgd(amount: float, currency: str, transaction_date: str) -> Dict[str, Any]:
+    fx_result = get_historical_fx_rate_to_sgd(currency, transaction_date)
+
+    if not fx_result["success"]:
+        return {
+            "success": False,
+            "amount_sgd": None,
+            "fx_rate": None,
+            "fx_rate_date": fx_result.get("fx_rate_date"),
+            "fx_source": fx_result.get("source"),
+            "message": fx_result.get("message"),
+        }
+
+    fx_rate = fx_result["rate"]
+    amount_sgd = round(float(amount) * float(fx_rate), 2)
+
+    return {
+        "success": True,
+        "amount_sgd": amount_sgd,
+        "fx_rate": fx_rate,
+        "fx_rate_date": fx_result.get("fx_rate_date"),
+        "fx_source": fx_result.get("source"),
+        "message": fx_result.get("message"),
+    }
+
+
+def append_transaction(row_data: List[Any]) -> None:
+    create_excel_if_missing()
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb["Transactions"]
+    ws.append(row_data)
+    wb.save(EXCEL_FILE)
+
+
+def load_transactions() -> List[Dict[str, Any]]:
+    create_excel_if_missing()
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb["Transactions"]
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows or len(rows) == 1:
+        return []
+
+    headers = rows[0]
+    data_rows = rows[1:]
+
+    transactions = []
+    for row in data_rows:
+        if any(cell is not None for cell in row):
+            transactions.append(dict(zip(headers, row)))
+
+    return transactions
+
+
+def load_transactions_df() -> pd.DataFrame:
+    transactions = load_transactions()
+    if not transactions:
+        return pd.DataFrame(columns=HEADERS)
+
+    df = pd.DataFrame(transactions)
+
+    for col in HEADERS:
+        if col not in df.columns:
+            df[col] = None
+
+    df = df[HEADERS]
+
+    for col in ["Amount", "FX_Rate_To_SGD", "Amount_SGD"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+def get_current_month_total(transactions: List[Dict[str, Any]]) -> Dict[str, float]:
+    totals: Dict[str, float] = {}
+    now = datetime.now()
+
+    for txn in transactions:
+        date_str = txn.get("Date")
+        currency = txn.get("Currency")
+        amount = txn.get("Amount")
+
+        if not date_str or amount is None or not currency:
+            continue
+
+        parsed_date = parse_date_to_datetime(str(date_str))
+        if parsed_date and parsed_date.year == now.year and parsed_date.month == now.month:
+            totals[currency] = totals.get(currency, 0.0) + float(amount)
+
+    return totals
+
+
+def get_current_month_total_sgd(transactions: List[Dict[str, Any]]) -> float:
+    total_sgd = 0.0
+    now = datetime.now()
+
+    for txn in transactions:
+        date_str = txn.get("Date")
+        amount_sgd = txn.get("Amount_SGD")
+
+        if not date_str or amount_sgd is None:
+            continue
+
+        parsed_date = parse_date_to_datetime(str(date_str))
+        if parsed_date and parsed_date.year == now.year and parsed_date.month == now.month:
+            total_sgd += float(amount_sgd)
+
+    return round(total_sgd, 2)
+
+
+def get_transactions_for_card(card_last_4: str) -> List[Dict[str, Any]]:
+    df = load_transactions_df()
+    if df.empty:
+        return []
+    return df[df["Card_Last_4"].astype(str) == str(card_last_4)].to_dict("records")
+
+
+def get_current_month_transactions_for_card(card_last_4: str) -> List[Dict[str, Any]]:
+    df = load_transactions_df()
+    if df.empty:
+        return []
+
+    card_df = df[df["Card_Last_4"].astype(str) == str(card_last_4)]
+    if card_df.empty:
+        return []
+
+    now = datetime.now()
+
+    def is_current_month(date_str: str) -> bool:
+        parsed = parse_date_to_datetime(str(date_str))
+        return bool(parsed and parsed.year == now.year and parsed.month == now.month)
+
+    return card_df[card_df["Date"].apply(is_current_month)].to_dict("records")
+
+
+def get_monthly_totals_by_card() -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    now = datetime.now()
+    df = load_transactions_df()
+
+    if df.empty:
+        return result
+
+    all_cards = sorted(df["Card_Last_4"].dropna().astype(str).unique().tolist())
+
+    for card_last_4 in all_cards:
+        card_df = df[df["Card_Last_4"].astype(str) == card_last_4].copy()
+        currency_totals: Dict[str, float] = {}
+        amount_sgd_total = 0.0
+
+        for _, row in card_df.iterrows():
+            parsed_date = parse_date_to_datetime(str(row.get("Date")))
+            if not parsed_date:
+                continue
+
+            if parsed_date.year == now.year and parsed_date.month == now.month:
+                currency = row.get("Currency")
+                amount = row.get("Amount")
+                amount_sgd = row.get("Amount_SGD")
+
+                if pd.notna(amount) and currency:
+                    currency_totals[currency] = currency_totals.get(currency, 0.0) + float(amount)
+                if pd.notna(amount_sgd):
+                    amount_sgd_total += float(amount_sgd)
+
+        result[card_last_4] = {
+            "currency_totals": currency_totals,
+            "amount_sgd_total": round(amount_sgd_total, 2),
+        }
+
+    return result
+
+
+def get_overall_totals_by_card_all_time() -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    df = load_transactions_df()
+
+    if df.empty:
+        return result
+
+    all_cards = sorted(df["Card_Last_4"].dropna().astype(str).unique().tolist())
+
+    for card_last_4 in all_cards:
+        card_df = df[df["Card_Last_4"].astype(str) == card_last_4].copy()
+
+        currency_totals: Dict[str, float] = {}
+        amount_sgd_total = 0.0
+
+        for _, row in card_df.iterrows():
+            currency = row.get("Currency")
+            amount = row.get("Amount")
+            amount_sgd = row.get("Amount_SGD")
+
+            if pd.notna(amount) and currency:
+                currency_totals[currency] = currency_totals.get(currency, 0.0) + float(amount)
+            if pd.notna(amount_sgd):
+                amount_sgd_total += float(amount_sgd)
+
+        result[card_last_4] = {
+            "currency_totals": currency_totals,
+            "amount_sgd_total": round(amount_sgd_total, 2),
+            "card_label": card_df.iloc[0]["Card_Label"] if not card_df.empty else f"Card - {card_last_4}",
+            "bank": card_df.iloc[0]["Bank"] if not card_df.empty else "Unknown",
+        }
+
+    return result
+
+
+def detect_bank_from_sms(sms_content: str, card_last_4: str) -> str:
+    sms_upper = sms_content.upper()
+
+    if "UOB" in sms_upper:
+        return "UOB"
+    if "OCBC" in sms_upper:
+        return "OCBC"
+    if "DBS" in sms_upper or "POSB" in sms_upper:
+        return "DBS"
+    if "CITI" in sms_upper or "CITIBANK" in sms_upper:
+        return "CITIBANK"
+    if "MAYBANK" in sms_upper:
+        return "MAYBANK"
+    if "SCB" in sms_upper or "STANDARD CHARTERED" in sms_upper:
+        return "Standard Chartered"
+    if "HSBC" in sms_upper:
+        return "HSBC"
+
+    return "Unknown"
+
+
+def get_card_info(card_last_4: str, sms_content: str) -> Dict[str, str]:
+    bank = detect_bank_from_sms(sms_content, card_last_4)
+    label = f"{bank} - {card_last_4}" if bank != "Unknown" else f"Card - {card_last_4}"
+    return {"bank": bank, "label": label}
+
+
+def submit_transaction(sms_content: str) -> Dict[str, Any]:
+    initialize_files()
+    ensure_monthly_reset()
+
+    sms_content = sms_content.strip()
+    if not sms_content:
+        return {"success": False, "message": "SMS content is empty."}
+
+    parsed = parse_sms_content(sms_content)
+
+    if not parsed["date"]:
+        return {"success": False, "message": "Could not detect date."}
+    if not parsed["currency"] or parsed["amount"] is None:
+        return {"success": False, "message": "Could not detect amount/currency."}
+    if not parsed["description"]:
+        return {"success": False, "message": "Could not detect description after 'at'."}
+    if not parsed["card_last_4"]:
+        return {"success": False, "message": "Could not detect 4-digit card number after 'ending with'."}
+
+    card_info = get_card_info(parsed["card_last_4"], sms_content)
+
+    conversion = convert_amount_to_sgd(
+        amount=float(parsed["amount"]),
+        currency=str(parsed["currency"]),
+        transaction_date=str(parsed["date"]),
+    )
+
+    if not conversion["success"]:
+        return {
+            "success": False,
+            "message": f"Transaction parsed but FX conversion failed. {conversion['message']}",
+            "parsed": parsed,
+            "card_info": card_info,
+        }
+
+    row = [
+        parsed["card_last_4"],
+        card_info["bank"],
+        card_info["label"],
+        parsed["date"],
+        parsed["currency"],
+        parsed["amount"],
+        conversion["fx_rate"],
+        conversion["amount_sgd"],
+        conversion["fx_rate_date"],
+        conversion["fx_source"],
+        parsed["description"],
+        sms_content,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ]
+
+    append_transaction(row)
+
+    return {
+        "success": True,
+        "message": "Transaction saved successfully.",
+        "parsed": parsed,
+        "card_info": card_info,
+        "conversion": conversion,
+    }
+
+
+@app.route("/")
+def home():
+    return render_template("home.html")
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
+
+
+@app.route("/health")
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "data_dir": DATA_DIR,
+    }), 200
+
+
+@app.route("/api/transactions", methods=["GET"])
+def get_all_transactions():
+    try:
+        transactions = load_transactions()
+        return jsonify({"success": True, "count": len(transactions), "transactions": transactions}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/transactions/<card_last_4>", methods=["GET"])
+def get_transactions_by_card(card_last_4: str):
+    try:
+        transactions = get_transactions_for_card(card_last_4)
+        return jsonify({
+            "success": True,
+            "card_last_4": card_last_4,
+            "count": len(transactions),
+            "transactions": transactions,
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/transactions/current-month/<card_last_4>", methods=["GET"])
+def get_current_month_transactions_by_card(card_last_4: str):
+    try:
+        transactions = get_current_month_transactions_for_card(card_last_4)
+        return jsonify({
+            "success": True,
+            "card_last_4": card_last_4,
+            "count": len(transactions),
+            "transactions": transactions,
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/totals/monthly", methods=["GET"])
+def get_monthly_totals():
+    try:
+        transactions = load_transactions()
+        return jsonify({
+            "success": True,
+            "currency_totals": get_current_month_total(transactions),
+            "sgd_total": get_current_month_total_sgd(transactions),
+            "month": datetime.now().strftime("%Y-%m"),
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/totals/monthly/by-card", methods=["GET"])
+def get_monthly_totals_by_card_endpoint():
+    try:
+        totals = get_monthly_totals_by_card()
+        df = load_transactions_df()
+        result = {}
+
+        for card_last_4, card_data in totals.items():
+            card_df = df[df["Card_Last_4"].astype(str) == str(card_last_4)]
+            result[card_last_4] = {
+                "card_label": card_df.iloc[0]["Card_Label"] if not card_df.empty else f"Card - {card_last_4}",
+                "bank": card_df.iloc[0]["Bank"] if not card_df.empty else "Unknown",
+                "currency_totals": card_data["currency_totals"],
+                "amount_sgd_total": card_data["amount_sgd_total"],
             }
 
-            setStatus("Submitting transaction...");
-            const result = await apiPost("/api/submit", { sms_content: sms });
-            document.getElementById("resultBox").textContent = JSON.stringify(result.data, null, 2);
+        return jsonify({"success": True, "totals": result, "month": datetime.now().strftime("%Y-%m")}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-            if (result.ok) {
-                setStatus("Transaction saved successfully.");
-                document.getElementById("smsInput").value = "";
-                await loadDashboard();
-            } else {
-                setStatus("Submit failed.", true);
-            }
-        }
 
-        async function resetAll() {
-            const confirmed = confirm("This will clear all transactions. Continue?");
-            if (!confirmed) return;
+@app.route("/api/totals/all-time", methods=["GET"])
+def get_all_time_totals():
+    try:
+        return jsonify({"success": True, "totals": get_overall_totals_by_card_all_time()}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-            setStatus("Resetting...");
-            const result = await apiPost("/api/reset", { confirm: "yes" });
-            document.getElementById("resultBox").textContent = JSON.stringify(result.data, null, 2);
 
-            if (result.ok) {
-                setStatus("All transactions cleared.");
-                await loadDashboard();
-            } else {
-                setStatus("Reset failed.", true);
-            }
-        }
+@app.route("/api/submit", methods=["POST"])
+def submit_transaction_api():
+    try:
+        data = request.get_json(silent=True) or {}
+        sms_content = str(data.get("sms_content", "")).strip()
 
-        async function deleteTransaction(rowId) {
-            const confirmed = confirm(`Delete transaction ${rowId}?`);
-            if (!confirmed) return;
+        if not sms_content:
+            return jsonify({"success": False, "message": "SMS content is required"}), 400
 
-            setStatus("Deleting transaction...");
-            const result = await apiDelete(`/api/transactions/${rowId}`);
-            document.getElementById("resultBox").textContent = JSON.stringify(result.data, null, 2);
+        result = submit_transaction(sms_content)
+        return (jsonify(result), 200) if result["success"] else (jsonify(result), 400)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-            if (result.ok) {
-                setStatus("Transaction deleted successfully.");
-                await loadDashboard();
-            } else {
-                setStatus("Delete failed.", true);
-            }
-        }
 
-        async function loadStats() {
-            const data = await apiGet("/api/stats");
-            const stats = data.stats || {};
-            const grid = document.getElementById("statsGrid");
+@app.route("/api/reset", methods=["POST"])
+def reset_transactions_api():
+    try:
+        data = request.get_json(silent=True) or {}
+        confirm = str(data.get("confirm", ""))
 
-            const items = [
-                ["Total Transactions", stats.total_transactions ?? 0],
-                ["Total Amount SGD", stats.total_amount_sgd ?? 0],
-                ["Unique Cards", stats.unique_cards ?? 0],
-                ["Current Month Transactions", stats.current_month_transactions ?? 0],
-                ["Current Month Amount SGD", stats.current_month_amount_sgd ?? 0]
-            ];
+        if confirm != "yes":
+            return jsonify({
+                "success": False,
+                "message": "Reset not confirmed. Please set confirm to 'yes'",
+            }), 400
 
-            grid.innerHTML = items.map(([label, value]) => `
-                <div class="stat">
-                    <div class="muted">${label}</div>
-                    <div style="font-size:24px;font-weight:bold;margin-top:6px;">${value}</div>
-                </div>
-            `).join("");
-        }
+        clear_excel_transactions()
+        state = read_state()
+        state["last_reset_month"] = ""
+        write_state(state)
 
-        async function loadMonthlyTotals() {
-            const data = await apiGet("/api/totals/monthly/by-card");
-            document.getElementById("monthlyTotals").textContent = JSON.stringify(data, null, 2);
-        }
+        return jsonify({"success": True, "message": "All transactions have been cleared"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-        async function loadCardsFilter() {
-            const data = await apiGet("/api/cards");
-            const select = document.getElementById("cardFilter");
-            const currentValue = select.value;
 
-            select.innerHTML = `<option value="">All Cards</option>`;
+@app.route("/api/cards", methods=["GET"])
+def get_all_cards():
+    try:
+        df = load_transactions_df()
+        if df.empty:
+            return jsonify({"success": True, "cards": []}), 200
 
-            if (data.cards && data.cards.length > 0) {
-                data.cards.forEach(card => {
-                    const option = document.createElement("option");
-                    option.value = card.card_last_4;
-                    option.textContent = `${card.card_label} (${card.transaction_count})`;
-                    select.appendChild(option);
-                });
-            }
+        cards = []
+        for card_last_4 in df["Card_Last_4"].dropna().astype(str).unique():
+            card_df = df[df["Card_Last_4"].astype(str) == card_last_4]
+            cards.append({
+                "card_last_4": card_last_4,
+                "card_label": card_df.iloc[0]["Card_Label"],
+                "bank": card_df.iloc[0]["Bank"],
+                "transaction_count": int(len(card_df)),
+            })
 
-            if ([...select.options].some(opt => opt.value === currentValue)) {
-                select.value = currentValue;
-            }
-        }
+        return jsonify({"success": True, "cards": sorted(cards, key=lambda x: x["card_last_4"])}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-        function normalizeDateForDisplay(dateStr) {
-            if (!dateStr) return "";
-            const parts = String(dateStr).split("/");
-            if (parts.length !== 3) return String(dateStr);
-            const [dd, mm, yy] = parts;
-            const fullYear = yy.length === 2 ? `20${yy}` : yy;
-            return `${fullYear}-${mm}-${dd}`;
-        }
 
-        function buildChartFromTransactions(transactions) {
-            const dailyTotals = {};
+@app.route("/api/stats", methods=["GET"])
+def get_stats():
+    try:
+        df = load_transactions_df()
 
-            transactions.forEach(tx => {
-                const dateKey = normalizeDateForDisplay(tx.Date);
-                const amountSGD = parseFloat(tx.Amount_SGD || 0);
-
-                if (!dateKey || isNaN(amountSGD)) return;
-
-                if (!dailyTotals[dateKey]) {
-                    dailyTotals[dateKey] = 0;
-                }
-                dailyTotals[dateKey] += amountSGD;
-            });
-
-            const labels = Object.keys(dailyTotals).sort();
-            const values = labels.map(label => Number(dailyTotals[label].toFixed(2)));
-
-            const ctx = document.getElementById("spendingChart").getContext("2d");
-
-            if (spendingChartInstance) {
-                spendingChartInstance.destroy();
-            }
-
-            spendingChartInstance = new Chart(ctx, {
-                type: "bar",
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: "Daily Spending (SGD)",
-                        data: values,
-                        borderWidth: 1
-                    }]
+        if df.empty:
+            return jsonify({
+                "success": True,
+                "stats": {
+                    "total_transactions": 0,
+                    "total_amount_sgd": 0,
+                    "unique_cards": 0,
+                    "current_month_transactions": 0,
+                    "current_month_amount_sgd": 0,
                 },
-                options: {
-                    responsive: true,
-                    plugins: {
-                        legend: {
-                            display: true
-                        }
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            ticks: {
-                                callback: function(value) {
-                                    return value.toFixed ? value.toFixed(2) : value;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
+            }), 200
 
-        async function loadTransactions() {
-            const selectedCard = document.getElementById("cardFilter").value;
-            const url = selectedCard
-                ? `/api/transactions/${selectedCard}`
-                : "/api/transactions";
+        now = datetime.now()
 
-            const data = await apiGet(url);
-            const wrap = document.getElementById("transactionsWrap");
+        def is_current_month(date_value: Any) -> bool:
+            parsed = parse_date_to_datetime(str(date_value))
+            return bool(parsed and parsed.month == now.month and parsed.year == now.year)
 
-            if (!data.transactions || data.transactions.length === 0) {
-                wrap.innerHTML = "<p class='muted'>No transactions found.</p>";
+        current_month_df = df[df["Date"].apply(is_current_month)]
 
-                if (spendingChartInstance) {
-                    spendingChartInstance.destroy();
-                    spendingChartInstance = null;
-                }
-                return;
-            }
+        return jsonify({
+            "success": True,
+            "stats": {
+                "total_transactions": int(len(df)),
+                "total_amount_sgd": round(float(df["Amount_SGD"].fillna(0).sum()), 2),
+                "unique_cards": int(df["Card_Last_4"].nunique()),
+                "current_month_transactions": int(len(current_month_df)),
+                "current_month_amount_sgd": round(float(current_month_df["Amount_SGD"].fillna(0).sum()), 2),
+            },
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-            let totalAmountSGD = 0;
 
-            const rows = data.transactions.slice().reverse().map(tx => {
-                const amountSGD = parseFloat(tx.Amount_SGD || 0);
-                totalAmountSGD += isNaN(amountSGD) ? 0 : amountSGD;
+@app.route("/api/parse", methods=["POST"])
+def parse_sms_api():
+    try:
+        data = request.get_json(silent=True) or {}
+        sms_content = str(data.get("sms_content", "")).strip()
 
-                return `
-                    <tr>
-                        <td>${tx.Row_ID ?? ""}</td>
-                        <td>${tx.Date ?? ""}</td>
-                        <td>${tx.Card_Label ?? ""}</td>
-                        <td>${tx.Currency ?? ""}</td>
-                        <td>${tx.Amount ?? ""}</td>
-                        <td>${tx.Amount_SGD ?? ""}</td>
-                        <td>${tx.Description ?? ""}</td>
-                        <td>
-                            <button class="danger small" onclick="deleteTransaction('${tx.Row_ID}')">Delete</button>
-                        </td>
-                    </tr>
-                `;
-            }).join("");
+        if not sms_content:
+            return jsonify({"success": False, "message": "SMS content is required"}), 400
 
-            const footer = `
-                <tfoot>
-                    <tr style="font-weight:bold;background:#f9fafb;">
-                        <td colspan="5">Grand Total</td>
-                        <td>${totalAmountSGD.toFixed(2)}</td>
-                        <td colspan="2"></td>
-                    </tr>
-                </tfoot>
-            `;
+        parsed = parse_sms_content(sms_content)
+        bank = detect_bank_from_sms(sms_content, parsed.get("card_last_4") or "")
+        return jsonify({"success": True, "parsed": parsed, "detected_bank": bank}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-            wrap.innerHTML = `
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Row ID</th>
-                            <th>Date</th>
-                            <th>Card</th>
-                            <th>Currency</th>
-                            <th>Amount</th>
-                            <th>Amount SGD</th>
-                            <th>Description</th>
-                            <th>Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>${rows}</tbody>
-                    ${footer}
-                </table>
-            `;
 
-            buildChartFromTransactions(data.transactions);
-        }
+initialize_files()
 
-        async function loadDashboard() {
-            await loadStats();
-            await loadMonthlyTotals();
-            await loadCardsFilter();
-            await loadTransactions();
-        }
-
-        loadDashboard();
-    </script>
-</body>
-</html>
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(debug=True, host="0.0.0.0", port=port)
