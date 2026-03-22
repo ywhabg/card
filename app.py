@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Optional, Dict, Tuple, List, Any
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 
 import pandas as pd
@@ -14,9 +14,6 @@ from openpyxl import Workbook, load_workbook
 app = Flask(__name__)
 CORS(app)
 
-# =========================================
-# CONFIG
-# =========================================
 HEADERS = [
     "Card_Last_4",
     "Bank",
@@ -39,14 +36,6 @@ FX_API_BASE_URL = "https://api.frankfurter.dev/v1"
 
 
 def resolve_data_dir() -> str:
-    """
-    Resolve a writable data directory.
-
-    Order:
-    1. DATA_DIR environment variable if explicitly provided
-    2. /app/data if it already exists (Render persistent disk mount)
-    3. ./data under current working directory as safe fallback
-    """
     env_dir = os.getenv("DATA_DIR")
     if env_dir:
         return env_dir
@@ -71,14 +60,7 @@ def refresh_paths() -> None:
     FX_CACHE_FILE = os.path.join(DATA_DIR, "fx_cache.json")
 
 
-# =========================================
-# FILE SETUP
-# =========================================
 def ensure_data_folder() -> None:
-    """
-    Create the data folder safely.
-    If the configured folder is not writable, fall back to ./data.
-    """
     global DATA_DIR
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -99,9 +81,8 @@ def create_excel_if_missing() -> None:
 
 def create_state_if_missing() -> None:
     if not os.path.exists(STATE_FILE):
-        state = {"last_reset_month": ""}
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+            json.dump({"last_reset_month": ""}, f, indent=2)
 
 
 def create_fx_cache_if_missing() -> None:
@@ -117,7 +98,6 @@ def get_excel_headers() -> List[str]:
     wb = load_workbook(EXCEL_FILE)
     ws = wb["Transactions"]
     first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-
     if not first_row:
         return []
 
@@ -130,7 +110,6 @@ def rebuild_excel_with_new_headers() -> None:
     ws.title = "Transactions"
     ws.append(HEADERS)
     wb.save(EXCEL_FILE)
-    print("[INFO] Excel file rebuilt with latest headers.")
 
 
 def initialize_files() -> None:
@@ -141,14 +120,9 @@ def initialize_files() -> None:
 
     existing_headers = get_excel_headers()
     if existing_headers and existing_headers != HEADERS:
-        print("[WARNING] Existing Excel format is outdated or different.")
-        print("[WARNING] Rebuilding transactions.xlsx with latest headers.")
         rebuild_excel_with_new_headers()
 
 
-# =========================================
-# STATE / RESET
-# =========================================
 def read_state() -> Dict[str, Any]:
     create_state_if_missing()
     with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -191,12 +165,8 @@ def ensure_monthly_reset(today: Optional[datetime] = None) -> None:
         clear_excel_transactions()
         state["last_reset_month"] = current_month_key
         write_state(state)
-        print(f"[INFO] Auto-reset completed for month: {current_month_key}")
 
 
-# =========================================
-# PARSING
-# =========================================
 def parse_date_to_datetime(date_text: str) -> Optional[datetime]:
     formats = ["%d/%m/%y", "%d/%m/%Y"]
     for fmt in formats:
@@ -255,9 +225,6 @@ def parse_sms_content(text: str) -> Dict[str, Optional[Any]]:
     }
 
 
-# =========================================
-# FX CONVERSION
-# =========================================
 def to_api_date(date_text: str) -> Optional[str]:
     parsed = parse_date_to_datetime(date_text)
     return parsed.strftime("%Y-%m-%d") if parsed else None
@@ -383,9 +350,6 @@ def convert_amount_to_sgd(amount: float, currency: str, transaction_date: str) -
     }
 
 
-# =========================================
-# EXCEL OPERATIONS
-# =========================================
 def append_transaction(row_data: List[Any]) -> None:
     create_excel_if_missing()
     wb = load_workbook(EXCEL_FILE)
@@ -427,16 +391,12 @@ def load_transactions_df() -> pd.DataFrame:
 
     df = df[HEADERS]
 
-    numeric_cols = ["Amount", "FX_Rate_To_SGD", "Amount_SGD"]
-    for col in numeric_cols:
+    for col in ["Amount", "FX_Rate_To_SGD", "Amount_SGD"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df
 
 
-# =========================================
-# TOTALS / FILTERING
-# =========================================
 def get_current_month_total(transactions: List[Dict[str, Any]]) -> Dict[str, float]:
     totals: Dict[str, float] = {}
     now = datetime.now()
@@ -450,10 +410,7 @@ def get_current_month_total(transactions: List[Dict[str, Any]]) -> Dict[str, flo
             continue
 
         parsed_date = parse_date_to_datetime(str(date_str))
-        if parsed_date is None:
-            continue
-
-        if parsed_date.year == now.year and parsed_date.month == now.month:
+        if parsed_date and parsed_date.year == now.year and parsed_date.month == now.month:
             totals[currency] = totals.get(currency, 0.0) + float(amount)
 
     return totals
@@ -471,10 +428,7 @@ def get_current_month_total_sgd(transactions: List[Dict[str, Any]]) -> float:
             continue
 
         parsed_date = parse_date_to_datetime(str(date_str))
-        if parsed_date is None:
-            continue
-
-        if parsed_date.year == now.year and parsed_date.month == now.month:
+        if parsed_date and parsed_date.year == now.year and parsed_date.month == now.month:
             total_sgd += float(amount_sgd)
 
     return round(total_sgd, 2)
@@ -484,8 +438,7 @@ def get_transactions_for_card(card_last_4: str) -> List[Dict[str, Any]]:
     df = load_transactions_df()
     if df.empty:
         return []
-    card_df = df[df["Card_Last_4"].astype(str) == str(card_last_4)]
-    return card_df.to_dict("records")
+    return df[df["Card_Last_4"].astype(str) == str(card_last_4)].to_dict("records")
 
 
 def get_current_month_transactions_for_card(card_last_4: str) -> List[Dict[str, Any]]:
@@ -503,15 +456,14 @@ def get_current_month_transactions_for_card(card_last_4: str) -> List[Dict[str, 
         parsed = parse_date_to_datetime(str(date_str))
         return bool(parsed and parsed.year == now.year and parsed.month == now.month)
 
-    current_month_df = card_df[card_df["Date"].apply(is_current_month)]
-    return current_month_df.to_dict("records")
+    return card_df[card_df["Date"].apply(is_current_month)].to_dict("records")
 
 
 def get_monthly_totals_by_card() -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
     now = datetime.now()
-
     df = load_transactions_df()
+
     if df.empty:
         return result
 
@@ -519,21 +471,19 @@ def get_monthly_totals_by_card() -> Dict[str, Dict[str, Any]]:
 
     for card_last_4 in all_cards:
         card_df = df[df["Card_Last_4"].astype(str) == card_last_4].copy()
-
         currency_totals: Dict[str, float] = {}
         amount_sgd_total = 0.0
 
         for _, row in card_df.iterrows():
-            date_str = row.get("Date")
-            currency = row.get("Currency")
-            amount = row.get("Amount")
-            amount_sgd = row.get("Amount_SGD")
-
-            parsed_date = parse_date_to_datetime(str(date_str))
-            if parsed_date is None:
+            parsed_date = parse_date_to_datetime(str(row.get("Date")))
+            if not parsed_date:
                 continue
 
             if parsed_date.year == now.year and parsed_date.month == now.month:
+                currency = row.get("Currency")
+                amount = row.get("Amount")
+                amount_sgd = row.get("Amount_SGD")
+
                 if pd.notna(amount) and currency:
                     currency_totals[currency] = currency_totals.get(currency, 0.0) + float(amount)
                 if pd.notna(amount_sgd):
@@ -549,8 +499,8 @@ def get_monthly_totals_by_card() -> Dict[str, Dict[str, Any]]:
 
 def get_overall_totals_by_card_all_time() -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
-
     df = load_transactions_df()
+
     if df.empty:
         return result
 
@@ -569,7 +519,6 @@ def get_overall_totals_by_card_all_time() -> Dict[str, Dict[str, Any]]:
 
             if pd.notna(amount) and currency:
                 currency_totals[currency] = currency_totals.get(currency, 0.0) + float(amount)
-
             if pd.notna(amount_sgd):
                 amount_sgd_total += float(amount_sgd)
 
@@ -583,9 +532,6 @@ def get_overall_totals_by_card_all_time() -> Dict[str, Dict[str, Any]]:
     return result
 
 
-# =========================================
-# BUSINESS LOGIC
-# =========================================
 def detect_bank_from_sms(sms_content: str, card_last_4: str) -> str:
     sms_upper = sms_content.upper()
 
@@ -618,7 +564,6 @@ def submit_transaction(sms_content: str) -> Dict[str, Any]:
     ensure_monthly_reset()
 
     sms_content = sms_content.strip()
-
     if not sms_content:
         return {"success": False, "message": "SMS content is empty."}
 
@@ -626,13 +571,10 @@ def submit_transaction(sms_content: str) -> Dict[str, Any]:
 
     if not parsed["date"]:
         return {"success": False, "message": "Could not detect date."}
-
     if not parsed["currency"] or parsed["amount"] is None:
         return {"success": False, "message": "Could not detect amount/currency."}
-
     if not parsed["description"]:
         return {"success": False, "message": "Could not detect description after 'at'."}
-
     if not parsed["card_last_4"]:
         return {"success": False, "message": "Could not detect 4-digit card number after 'ending with'."}
 
@@ -679,50 +621,23 @@ def submit_transaction(sms_content: str) -> Dict[str, Any]:
     }
 
 
-# =========================================
-# ROUTES
-# =========================================
-@app.route("/", methods=["GET", "HEAD"])
+@app.route("/")
 def home():
-    return jsonify(
-        {
-            "success": True,
-            "service": "credit-card-sms-tracker",
-            "status": "running",
-            "data_dir": DATA_DIR,
-            "timestamp": datetime.now().isoformat(),
-            "endpoints": [
-                "/health",
-                "/api/transactions",
-                "/api/transactions/<card_last_4>",
-                "/api/transactions/current-month/<card_last_4>",
-                "/api/submit",
-                "/api/totals/monthly",
-                "/api/totals/monthly/by-card",
-                "/api/totals/all-time",
-                "/api/cards",
-                "/api/stats",
-                "/api/parse",
-                "/api/reset",
-            ],
-        }
-    ), 200
+    return render_template("home.html")
 
 
-@app.route("/favicon.ico", methods=["GET"])
+@app.route("/favicon.ico")
 def favicon():
     return "", 204
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health_check():
-    return jsonify(
-        {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "data_dir": DATA_DIR,
-        }
-    ), 200
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "data_dir": DATA_DIR,
+    }), 200
 
 
 @app.route("/api/transactions", methods=["GET"])
@@ -738,14 +653,12 @@ def get_all_transactions():
 def get_transactions_by_card(card_last_4: str):
     try:
         transactions = get_transactions_for_card(card_last_4)
-        return jsonify(
-            {
-                "success": True,
-                "card_last_4": card_last_4,
-                "count": len(transactions),
-                "transactions": transactions,
-            }
-        ), 200
+        return jsonify({
+            "success": True,
+            "card_last_4": card_last_4,
+            "count": len(transactions),
+            "transactions": transactions,
+        }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -754,14 +667,12 @@ def get_transactions_by_card(card_last_4: str):
 def get_current_month_transactions_by_card(card_last_4: str):
     try:
         transactions = get_current_month_transactions_for_card(card_last_4)
-        return jsonify(
-            {
-                "success": True,
-                "card_last_4": card_last_4,
-                "count": len(transactions),
-                "transactions": transactions,
-            }
-        ), 200
+        return jsonify({
+            "success": True,
+            "card_last_4": card_last_4,
+            "count": len(transactions),
+            "transactions": transactions,
+        }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -770,17 +681,12 @@ def get_current_month_transactions_by_card(card_last_4: str):
 def get_monthly_totals():
     try:
         transactions = load_transactions()
-        currency_totals = get_current_month_total(transactions)
-        sgd_total = get_current_month_total_sgd(transactions)
-
-        return jsonify(
-            {
-                "success": True,
-                "currency_totals": currency_totals,
-                "sgd_total": sgd_total,
-                "month": datetime.now().strftime("%Y-%m"),
-            }
-        ), 200
+        return jsonify({
+            "success": True,
+            "currency_totals": get_current_month_total(transactions),
+            "sgd_total": get_current_month_total_sgd(transactions),
+            "month": datetime.now().strftime("%Y-%m"),
+        }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -790,16 +696,13 @@ def get_monthly_totals_by_card_endpoint():
     try:
         totals = get_monthly_totals_by_card()
         df = load_transactions_df()
-
         result = {}
+
         for card_last_4, card_data in totals.items():
             card_df = df[df["Card_Last_4"].astype(str) == str(card_last_4)]
-            card_label = card_df.iloc[0]["Card_Label"] if not card_df.empty else f"Card - {card_last_4}"
-            bank = card_df.iloc[0]["Bank"] if not card_df.empty else "Unknown"
-
             result[card_last_4] = {
-                "card_label": card_label,
-                "bank": bank,
+                "card_label": card_df.iloc[0]["Card_Label"] if not card_df.empty else f"Card - {card_last_4}",
+                "bank": card_df.iloc[0]["Bank"] if not card_df.empty else "Unknown",
                 "currency_totals": card_data["currency_totals"],
                 "amount_sgd_total": card_data["amount_sgd_total"],
             }
@@ -812,8 +715,7 @@ def get_monthly_totals_by_card_endpoint():
 @app.route("/api/totals/all-time", methods=["GET"])
 def get_all_time_totals():
     try:
-        totals = get_overall_totals_by_card_all_time()
-        return jsonify({"success": True, "totals": totals}), 200
+        return jsonify({"success": True, "totals": get_overall_totals_by_card_all_time()}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -829,7 +731,6 @@ def submit_transaction_api():
 
         result = submit_transaction(sms_content)
         return (jsonify(result), 200) if result["success"] else (jsonify(result), 400)
-
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -841,15 +742,12 @@ def reset_transactions_api():
         confirm = str(data.get("confirm", ""))
 
         if confirm != "yes":
-            return jsonify(
-                {
-                    "success": False,
-                    "message": "Reset not confirmed. Please set confirm to 'yes'",
-                }
-            ), 400
+            return jsonify({
+                "success": False,
+                "message": "Reset not confirmed. Please set confirm to 'yes'",
+            }), 400
 
         clear_excel_transactions()
-
         state = read_state()
         state["last_reset_month"] = ""
         write_state(state)
@@ -869,14 +767,12 @@ def get_all_cards():
         cards = []
         for card_last_4 in df["Card_Last_4"].dropna().astype(str).unique():
             card_df = df[df["Card_Last_4"].astype(str) == card_last_4]
-            cards.append(
-                {
-                    "card_last_4": card_last_4,
-                    "card_label": card_df.iloc[0]["Card_Label"],
-                    "bank": card_df.iloc[0]["Bank"],
-                    "transaction_count": int(len(card_df)),
-                }
-            )
+            cards.append({
+                "card_last_4": card_last_4,
+                "card_label": card_df.iloc[0]["Card_Label"],
+                "bank": card_df.iloc[0]["Bank"],
+                "transaction_count": int(len(card_df)),
+            })
 
         return jsonify({"success": True, "cards": sorted(cards, key=lambda x: x["card_last_4"])}), 200
     except Exception as e:
@@ -889,18 +785,16 @@ def get_stats():
         df = load_transactions_df()
 
         if df.empty:
-            return jsonify(
-                {
-                    "success": True,
-                    "stats": {
-                        "total_transactions": 0,
-                        "total_amount_sgd": 0,
-                        "unique_cards": 0,
-                        "current_month_transactions": 0,
-                        "current_month_amount_sgd": 0,
-                    },
-                }
-            ), 200
+            return jsonify({
+                "success": True,
+                "stats": {
+                    "total_transactions": 0,
+                    "total_amount_sgd": 0,
+                    "unique_cards": 0,
+                    "current_month_transactions": 0,
+                    "current_month_amount_sgd": 0,
+                },
+            }), 200
 
         now = datetime.now()
 
@@ -910,15 +804,16 @@ def get_stats():
 
         current_month_df = df[df["Date"].apply(is_current_month)]
 
-        stats = {
-            "total_transactions": int(len(df)),
-            "total_amount_sgd": round(float(df["Amount_SGD"].fillna(0).sum()), 2),
-            "unique_cards": int(df["Card_Last_4"].nunique()),
-            "current_month_transactions": int(len(current_month_df)),
-            "current_month_amount_sgd": round(float(current_month_df["Amount_SGD"].fillna(0).sum()), 2),
-        }
-
-        return jsonify({"success": True, "stats": stats}), 200
+        return jsonify({
+            "success": True,
+            "stats": {
+                "total_transactions": int(len(df)),
+                "total_amount_sgd": round(float(df["Amount_SGD"].fillna(0).sum()), 2),
+                "unique_cards": int(df["Card_Last_4"].nunique()),
+                "current_month_transactions": int(len(current_month_df)),
+                "current_month_amount_sgd": round(float(current_month_df["Amount_SGD"].fillna(0).sum()), 2),
+            },
+        }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -934,13 +829,11 @@ def parse_sms_api():
 
         parsed = parse_sms_content(sms_content)
         bank = detect_bank_from_sms(sms_content, parsed.get("card_last_4") or "")
-
         return jsonify({"success": True, "parsed": parsed, "detected_bank": bank}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# Initialize files when module is imported by Gunicorn
 initialize_files()
 
 if __name__ == "__main__":
