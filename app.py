@@ -17,14 +17,6 @@ CORS(app)
 # =========================================
 # CONFIG
 # =========================================
-# Use Render persistent disk path by default.
-# You can override with an environment variable if needed.
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-
-EXCEL_FILE = os.path.join(DATA_DIR, "transactions.xlsx")
-STATE_FILE = os.path.join(DATA_DIR, "app_state.json")
-FX_CACHE_FILE = os.path.join(DATA_DIR, "fx_cache.json")
-
 HEADERS = [
     "Card_Last_4",
     "Bank",
@@ -46,11 +38,54 @@ FX_SOURCE_NAME = "Frankfurter"
 FX_API_BASE_URL = "https://api.frankfurter.dev/v1"
 
 
+def resolve_data_dir() -> str:
+    """
+    Resolve a writable data directory.
+
+    Order:
+    1. DATA_DIR environment variable if explicitly provided
+    2. /app/data if it already exists (Render persistent disk mount)
+    3. ./data under current working directory as safe fallback
+    """
+    env_dir = os.getenv("DATA_DIR")
+    if env_dir:
+        return env_dir
+
+    render_disk = "/app/data"
+    if os.path.exists(render_disk):
+        return render_disk
+
+    return os.path.join(os.getcwd(), "data")
+
+
+DATA_DIR = resolve_data_dir()
+EXCEL_FILE = os.path.join(DATA_DIR, "transactions.xlsx")
+STATE_FILE = os.path.join(DATA_DIR, "app_state.json")
+FX_CACHE_FILE = os.path.join(DATA_DIR, "fx_cache.json")
+
+
+def refresh_paths() -> None:
+    global EXCEL_FILE, STATE_FILE, FX_CACHE_FILE
+    EXCEL_FILE = os.path.join(DATA_DIR, "transactions.xlsx")
+    STATE_FILE = os.path.join(DATA_DIR, "app_state.json")
+    FX_CACHE_FILE = os.path.join(DATA_DIR, "fx_cache.json")
+
+
 # =========================================
 # FILE SETUP
 # =========================================
 def ensure_data_folder() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
+    """
+    Create the data folder safely.
+    If the configured folder is not writable, fall back to ./data.
+    """
+    global DATA_DIR
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except PermissionError:
+        DATA_DIR = os.path.join(os.getcwd(), "data")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        refresh_paths()
 
 
 def create_excel_if_missing() -> None:
@@ -105,7 +140,7 @@ def initialize_files() -> None:
     create_fx_cache_if_missing()
 
     existing_headers = get_excel_headers()
-    if existing_headers != HEADERS:
+    if existing_headers and existing_headers != HEADERS:
         print("[WARNING] Existing Excel format is outdated or different.")
         print("[WARNING] Rebuilding transactions.xlsx with latest headers.")
         rebuild_excel_with_new_headers()
@@ -114,24 +149,24 @@ def initialize_files() -> None:
 # =========================================
 # STATE / RESET
 # =========================================
-def read_state() -> Dict:
+def read_state() -> Dict[str, Any]:
     create_state_if_missing()
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def write_state(state: Dict) -> None:
+def write_state(state: Dict[str, Any]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
 
-def read_fx_cache() -> Dict:
+def read_fx_cache() -> Dict[str, Any]:
     create_fx_cache_if_missing()
     with open(FX_CACHE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def write_fx_cache(cache: Dict) -> None:
+def write_fx_cache(cache: Dict[str, Any]) -> None:
     with open(FX_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2)
 
@@ -205,7 +240,7 @@ def extract_card_last_4(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def parse_sms_content(text: str) -> Dict[str, Optional[str]]:
+def parse_sms_content(text: str) -> Dict[str, Optional[Any]]:
     date_text = extract_date(text)
     currency, amount = extract_amount_and_currency(text)
     description = extract_description(text)
@@ -394,8 +429,7 @@ def load_transactions_df() -> pd.DataFrame:
 
     numeric_cols = ["Amount", "FX_Rate_To_SGD", "Amount_SGD"]
     for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df
 
@@ -576,7 +610,6 @@ def detect_bank_from_sms(sms_content: str, card_last_4: str) -> str:
 def get_card_info(card_last_4: str, sms_content: str) -> Dict[str, str]:
     bank = detect_bank_from_sms(sms_content, card_last_4)
     label = f"{bank} - {card_last_4}" if bank != "Unknown" else f"Card - {card_last_4}"
-
     return {"bank": bank, "label": label}
 
 
@@ -656,10 +689,13 @@ def home():
             "success": True,
             "service": "credit-card-sms-tracker",
             "status": "running",
+            "data_dir": DATA_DIR,
             "timestamp": datetime.now().isoformat(),
             "endpoints": [
                 "/health",
                 "/api/transactions",
+                "/api/transactions/<card_last_4>",
+                "/api/transactions/current-month/<card_last_4>",
                 "/api/submit",
                 "/api/totals/monthly",
                 "/api/totals/monthly/by-card",
@@ -680,7 +716,13 @@ def favicon():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
+    return jsonify(
+        {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "data_dir": DATA_DIR,
+        }
+    ), 200
 
 
 @app.route("/api/transactions", methods=["GET"])
@@ -780,8 +822,8 @@ def get_all_time_totals():
 def submit_transaction_api():
     try:
         data = request.get_json(silent=True) or {}
+        sms_content = str(data.get("sms_content", "")).strip()
 
-        sms_content = data.get("sms_content", "").strip()
         if not sms_content:
             return jsonify({"success": False, "message": "SMS content is required"}), 400
 
@@ -796,7 +838,7 @@ def submit_transaction_api():
 def reset_transactions_api():
     try:
         data = request.get_json(silent=True) or {}
-        confirm = data.get("confirm", "")
+        confirm = str(data.get("confirm", ""))
 
         if confirm != "yes":
             return jsonify(
@@ -832,7 +874,7 @@ def get_all_cards():
                     "card_last_4": card_last_4,
                     "card_label": card_df.iloc[0]["Card_Label"],
                     "bank": card_df.iloc[0]["Bank"],
-                    "transaction_count": len(card_df),
+                    "transaction_count": int(len(card_df)),
                 }
             )
 
@@ -885,8 +927,8 @@ def get_stats():
 def parse_sms_api():
     try:
         data = request.get_json(silent=True) or {}
+        sms_content = str(data.get("sms_content", "")).strip()
 
-        sms_content = data.get("sms_content", "").strip()
         if not sms_content:
             return jsonify({"success": False, "message": "SMS content is required"}), 400
 
@@ -902,4 +944,5 @@ def parse_sms_api():
 initialize_files()
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(debug=True, host="0.0.0.0", port=port)
